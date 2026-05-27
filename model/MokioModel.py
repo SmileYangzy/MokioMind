@@ -1,5 +1,12 @@
-from transformers import PretrainedConfig
-
+import torch
+import math
+import torch.nn as nn
+from torch.nn import init
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -70,17 +77,6 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
-
-
-import torch
-import math
-import torch.nn as nn
-from torch.nn import init
-from typing import Optional, Tuple, List, Union
-import torch.nn.functional as F
-from transformers.activations import ACT2FN
-from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
@@ -163,6 +159,7 @@ def precompute_freqs(
     freqs = torch.outer(t, freqs).float()
 
     # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    # 前后半配对，不是相邻配对
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
@@ -183,7 +180,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     )
     return q_embed, k_embed
 
-
+# GQA，允许每个查询头对应多个KV头，从而提升模型容量和性能。
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
@@ -229,6 +226,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        # flash attention允许使用 PyTorch 内置的高效 Attention
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
             and args.flash_attention
@@ -242,12 +240,16 @@ class Attention(nn.Module):
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        # 投影，计算q,k,v
         bsz, seq_len, _ = x.shape
+
+        # 把输入拆分成多个头，用view
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # q,k应用RoPE位置编码    
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
@@ -259,10 +261,11 @@ class Attention(nn.Module):
 
         xq, xk, xv = (
             xq.transpose(1, 2),
+            #[bsz, n_local_heads, seq_len, head_dim] 
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
-
+        # 进行attention计算,q@k^T / sqrt(d)，加上mask，softmax，乘v
         if (
             self.flash
             and (seq_len > 1)
@@ -276,12 +279,13 @@ class Attention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
             )
+        # 兼容不满足flash attention条件的情况，使用传统的attention计算方式
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores[:, :, :, -seq_len:] += torch.triu(
+            scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1,
-            )
+            ).unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -291,13 +295,19 @@ class Attention(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
-
+        #此处没做attention后的残差连接，真正的残差连接是在外面调用这个Attention的Block里做的
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
 
 class FeedForward(nn.Module):
+    # 初始化
+    # 升维
+    # 降维
+    # 门控
+    # dropout
+    # 激活函数
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         if config.intermediate_size is None:
@@ -545,13 +555,14 @@ class MokioMindModel(nn.Module):
             [MokioMindBlock(l, config) for l in range(self.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        # RoPE预计算
         freqs_cos, freqs_sin = precompute_freqs(
             dim=config.hidden_size // config.num_attention_heads,
             end=config.max_position_embeddings,
             rope_base=config.rope_theta,
             rope_scaling=config.rope_scaling,
         )
+        # 把 RoPE 的 cos/sin 查表注册到模型中，让它们能跟着模型一起移动到 CPU/GPU，但不参与训练
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -565,13 +576,16 @@ class MokioMindModel(nn.Module):
     ):
         # input_ids: [bsz, seq_len]
         batch_size, seq_length = input_ids.shape
-
+        # 如果past_key_values存在且具有layers属性，
+        # 说明它是一个包含层信息的对象，而不是预期的列表格式。
+        # 在这种情况下，将past_key_values设置为None，以避免后续代码处理时出现错误。
         if hasattr(past_key_values, "layers"):
             past_key_values = None
 
         past_key_values = past_key_values or [None] * len(self.layers)
 
         # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # 主要用于给当前 token 选择正确的 RoPE 位置编码。
         start_pos = (
             past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
@@ -613,14 +627,20 @@ class MokioMindModel(nn.Module):
 
         return hidden_states, presents, aux_loss
 
-
+# huggingface的transformers库中，
+# PreTrainedModel是所有预训练模型的基类，提供了加载和保存模型权重、配置等功能。
+# GenerationMixin是一个混入类，提供了文本生成相关的方法，如generate()，可以让模型支持文本生成任务。
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MokioMindConfig
 
     def __init__(self, config: MokioMindConfig):
+        self.config = config
         super().__init__(config)
         self.model = MokioMindModel(config)
+        # 输出层，负责将模型的隐藏状态映射到词汇表大小的维度上
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # 权重共享
+        # 将输出层的权重与输入嵌入层的权重共享，减少模型参数量并提升性能。
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(
@@ -631,16 +651,18 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **args,
+        **kwargs,
     ):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **args,
+            **kwargs,
         )
-
+        # logits_to_keep参数允许用户指定在计算输出logits时只保留最后几个token的logits，
+        # 或者保留tensor指定的特定位置的logits
+        # 这对于长序列生成时节省计算资源非常有用。
         slice_indices = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int)

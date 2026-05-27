@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore")
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
-
+ 
     # 遍历数据批次
     for step, (input_ids, labels, attention_mask) in enumerate(
         loader, start=start_step + 1
@@ -42,8 +42,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         attention_mask = attention_mask.to(
-            args.device
-        )  # ！修正：接收并转移 attention_mask
+            args.device)  # ！修正：接收并转移 attention_mask
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -63,11 +62,11 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
-
+        # 梯度累计
         if step % args.accumulation_steps == 0:
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
-
+            # 限制模型梯度的最大范数，防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             # 📚 优化器更新知识点
@@ -77,12 +76,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
-
+        # 每隔一段训练 step，打印一次训练日志，并且可选地记录到 wandb
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
-
+            #其实step从1开始，eta_min = spend_time / step * (iters - step) // 60更合理，但为了兼容start_step不为0的情况，改为下面的计算方式
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
             Logger(
@@ -94,14 +93,15 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 wandb.log(
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
-
+        # 定期保存模型权重 checkpoint
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()  # 切换到评估模式
 
-            # 构建保存路径
+            # 决定保存文件名要不要加 _moe 后缀
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
+            # 构建保存路径
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
             # 📚 分布式模型保存知识点
@@ -119,10 +119,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 保存完整训练状态
             lm_checkpoint(
                 lm_config,
-                weight=args.save_weight,
+                weight=args.save_weight, # 把保存权重的名字前缀传进去，比如 "pretrain"
                 model=model,
                 optimizer=optimizer,
-                scaler=scaler,
+                scaler=scaler, # 把当前混合精度训练的 GradScaler 状态scaler.state_dict()传进去，用于断点续训时恢复
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）"
     )
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
 
     # ========== 硬件和性能参数 ==========
@@ -184,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="../dataset/pretrain_t2t_mini.jsonl",  # ！修正：原"dataset/..."缺少../前缀
         help="预训练数据路径",
     )
     parser.add_argument(

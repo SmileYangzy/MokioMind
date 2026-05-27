@@ -78,11 +78,18 @@ class PretrainDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         # 使用 HuggingFace datasets 的惰性加载，避免一次性读入大文件
-        self.samples = load_dataset("json", data_files=data_path, split="train")
+        self.samples = load_dataset(
+            "json", data_files=data_path, split="train")
 
     def __len__(self):
         return len(self.samples)
 
+    # 我们拿到的是，jsonl 文件中每行的文本数据，格式为 {"text": "一段原始文本"}
+    # tokenizer 会将文本转换为 input_ids
+    # 需要加上EOS, BOS，以及PAD填充
+    # 需要自行编写labels，防止PAD与loss计算
+    # 需要编写attention_mask，告诉模型哪些位置是有效的，哪些位置是PAD
+    # 我们要输出的，是 input_ids, attention_mask, labels
     def __getitem__(self, index):
         sample = self.samples[index]
 
@@ -91,18 +98,18 @@ class PretrainDataset(Dataset):
             str(sample["text"]),
             add_special_tokens=False,
             max_length=self.max_length - 2,  # 预留 BOS + EOS 的位置
-            truncation=True,
+            truncation=True, #如果文本 tokenize 后超过 max_length，就截断。
         ).input_ids
 
         # Step 2：拼接 BOS + token序列 + EOS，构成完整序列
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-
+ 
         # Step 3：右侧用 PAD 补齐到 max_length，保证 batch 内等长
         input_ids = tokens + [self.tokenizer.pad_token_id] * (
             self.max_length - len(tokens)
         )
         input_ids = torch.tensor(input_ids, dtype=torch.long)
-
+ 
         # Step 4：labels 与 input_ids 完全相同，但 PAD 位置置 -100，
         #         CrossEntropyLoss 会自动忽略 -100，不计入 loss
         labels = input_ids.clone()
@@ -132,7 +139,8 @@ class SFTDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset("json", data_files=jsonl_path, split="train")
+        self.samples = load_dataset(
+            "json", data_files=jsonl_path, split="train")
         # 预先 tokenize assistant 回复的起始标记（BOS + "assistant\n"）
         # 用于在 generate_labels 中定位每段 assistant 回复的开始位置
         self.bos_id = tokenizer(
@@ -188,19 +196,21 @@ class SFTDataset(Dataset):
         labels = [-100] * len(input_ids)
         i = 0
         while i < len(input_ids):
-            if input_ids[i : i + len(self.bos_id)] == self.bos_id:
+            if input_ids[i: i + len(self.bos_id)] == self.bos_id:
                 # 跳过 bos_id 本身，从 assistant 实际内容开始
                 start = i + len(self.bos_id)
                 end = start
                 # 向后扫描，找到 eos_id 的位置
                 while end < len(input_ids):
-                    if input_ids[end : end + len(self.eos_id)] == self.eos_id:
+                    if input_ids[end: end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
                 # 将 assistant 回复（含 EOS）区间的 label 设为真实 token id
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     labels[j] = input_ids[j]
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = end + \
+                    len(self.eos_id) if end < len(
+                        input_ids) else len(input_ids)
             else:
                 i += 1
         return labels
@@ -219,7 +229,8 @@ class SFTDataset(Dataset):
 
         # Step 4：tokenize 并截断到 max_length，不足则右侧 PAD 补齐
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        input_ids += [self.tokenizer.pad_token_id] * \
+            (self.max_length - len(input_ids))
 
         # Step 5：生成稀疏标签，只有 assistant 回复部分有有效 label
         labels = self.generate_labels(input_ids)
@@ -231,7 +242,8 @@ class SFTDataset(Dataset):
 
         # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask = (
-            torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
+            torch.tensor(
+                input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
         ).long()
         return (
             torch.tensor(input_ids, dtype=torch.long),
@@ -274,7 +286,8 @@ class DPODataset(Dataset):
         self.eos_id = tokenizer(
             f"{tokenizer.eos_token}\n", add_special_tokens=False
         ).input_ids
-        self.samples = load_dataset("json", data_files=file_path, split="train")
+        self.samples = load_dataset(
+            "json", data_files=file_path, split="train")
 
     def __len__(self):
         return len(self.samples)
@@ -327,10 +340,12 @@ class DPODataset(Dataset):
 
         # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask_chosen = (
-            torch.tensor(chosen_input_ids[:-1], dtype=torch.long) != self.padding
+            torch.tensor(chosen_input_ids[:-1],
+                         dtype=torch.long) != self.padding
         ).long()
         attention_mask_rejected = (
-            torch.tensor(rejected_input_ids[:-1], dtype=torch.long) != self.padding
+            torch.tensor(rejected_input_ids[:-1],
+                         dtype=torch.long) != self.padding
         ).long()
 
         return {
@@ -356,17 +371,19 @@ class DPODataset(Dataset):
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
-            if input_ids[i : i + len(self.bos_id)] == self.bos_id:
+            if input_ids[i: i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
-                    if input_ids[end : end + len(self.eos_id)] == self.eos_id:
+                    if input_ids[end: end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
                 # 将 assistant 回复（含 EOS）区间的 mask 置 1
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = end + \
+                    len(self.eos_id) if end < len(
+                        input_ids) else len(input_ids)
             else:
                 i += 1
         return loss_mask
@@ -397,7 +414,8 @@ class RLAIFDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset("json", data_files=jsonl_path, split="train")
+        self.samples = load_dataset(
+            "json", data_files=jsonl_path, split="train")
         # 保留 bos_id / eos_id 以兼容未来可能的 mask 扩展
         self.bos_id = tokenizer(
             f"{tokenizer.bos_token}assistant", add_special_tokens=False
